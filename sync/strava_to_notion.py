@@ -1,17 +1,9 @@
 #!/usr/bin/env python3
 """
 Strava → Notion sync service for Kristina's running coach.
-
-Runs on a schedule (every hour via Render cron job).
+Runs every hour via GitHub Actions (free).
 Fetches new runs from Strava and logs them to the Notion Runs database.
-Skips runs that are already in Notion (deduplication by Strava ID).
-
-Environment variables required:
-    STRAVA_CLIENT_ID       — Strava app client ID
-    STRAVA_CLIENT_SECRET   — Strava app client secret
-    STRAVA_REFRESH_TOKEN   — Long-lived refresh token
-    NOTION_TOKEN           — Notion integration token
-    NOTION_DATABASE_ID     — Notion Runs database ID
+Automatically assigns Week number, Phase, and Run Type.
 """
 
 import json
@@ -21,9 +13,9 @@ import time
 import urllib.request
 import urllib.parse
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, date, timezone, timedelta
 
-# ── Config from environment ──────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────────
 
 STRAVA_CLIENT_ID     = os.environ.get("STRAVA_CLIENT_ID")
 STRAVA_CLIENT_SECRET = os.environ.get("STRAVA_CLIENT_SECRET")
@@ -33,13 +25,44 @@ NOTION_DATABASE_ID   = os.environ.get("NOTION_DATABASE_ID", "33dd769ea65280d8aab
 
 STRAVA_TOKEN_URL      = "https://www.strava.com/oauth/token"
 STRAVA_ACTIVITIES_URL = "https://www.strava.com/api/v3/athlete/activities"
-NOTION_SEARCH_URL     = "https://api.notion.com/v1/databases/{}/query"
+NOTION_DB_QUERY_URL   = f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query"
 NOTION_PAGES_URL      = "https://api.notion.com/v1/pages"
 NOTION_VERSION        = "2022-06-28"
 
-# How many days back to check for new runs
 SYNC_LOOKBACK_DAYS = 3
 
+# ── Training plan config ─────────────────────────────────────────────────────
+
+PLAN_START = date(2026, 3, 16)  # Week 1 started March 16, 2026
+
+# Rest weeks (long run drops back) — every 4th week
+REST_WEEKS = {4, 8, 11, 14, 17, 20, 23}
+
+# Phase boundaries (inclusive week numbers)
+PHASES = [
+    (1,  11, "Phase 1 - Base"),
+    (12, 18, "Phase 2 - Tempo"),
+    (19, 25, "Phase 3 - Race Specific"),
+    (26, 27, "Phase 4 - Taper"),
+]
+
+
+def get_training_week(run_date: date) -> int:
+    """Calculate which training week a run falls in (1-indexed)."""
+    delta = (run_date - PLAN_START).days
+    if delta < 0:
+        return 0  # Before plan started
+    return (delta // 7) + 1
+
+
+def get_phase(week: int) -> str:
+    for start, end, name in PHASES:
+        if start <= week <= end:
+            return name
+    return "Phase 1 - Base"
+
+
+# ── Strava ───────────────────────────────────────────────────────────────────
 
 def check_env():
     missing = [v for v in ["STRAVA_CLIENT_ID", "STRAVA_CLIENT_SECRET",
@@ -49,10 +72,7 @@ def check_env():
         sys.exit(1)
 
 
-# ── Strava ───────────────────────────────────────────────────────────────────
-
 def get_strava_token():
-    """Exchange refresh token for a fresh access token."""
     data = urllib.parse.urlencode({
         "client_id": STRAVA_CLIENT_ID,
         "client_secret": STRAVA_CLIENT_SECRET,
@@ -69,7 +89,6 @@ def get_strava_token():
 
 
 def fetch_recent_runs(access_token, days=SYNC_LOOKBACK_DAYS):
-    """Fetch runs from the last N days."""
     after_ts = int(time.time()) - (days * 86400)
     url = f"{STRAVA_ACTIVITIES_URL}?per_page=50&after={after_ts}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {access_token}"})
@@ -77,7 +96,7 @@ def fetch_recent_runs(access_token, days=SYNC_LOOKBACK_DAYS):
         with urllib.request.urlopen(req) as resp:
             activities = json.loads(resp.read())
     except urllib.error.HTTPError as e:
-        print(f"ERROR: Strava activities fetch failed: {e.read().decode()}")
+        print(f"ERROR: Strava fetch failed: {e.read().decode()}")
         sys.exit(1)
     return [a for a in activities if a.get("sport_type") == "Run" or a.get("type") == "Run"]
 
@@ -93,10 +112,9 @@ def notion_headers():
 
 
 def get_existing_strava_ids():
-    """Fetch Strava IDs already logged in Notion (via Notes field)."""
-    url = NOTION_SEARCH_URL.format(NOTION_DATABASE_ID)
     payload = json.dumps({"page_size": 100}).encode()
-    req = urllib.request.Request(url, data=payload, headers=notion_headers(), method="POST")
+    req = urllib.request.Request(NOTION_DB_QUERY_URL, data=payload,
+                                 headers=notion_headers(), method="POST")
     try:
         with urllib.request.urlopen(req) as resp:
             results = json.loads(resp.read()).get("results", [])
@@ -115,42 +133,52 @@ def get_existing_strava_ids():
 
 
 def format_pace(speed_ms):
-    """Convert m/s to MM:SS/km string."""
     if not speed_ms or speed_ms <= 0:
         return ""
     secs = 1000 / speed_ms
     return f"{int(secs // 60)}:{int(secs % 60):02d}"
 
 
-def infer_run_type(activity):
-    """Guess run type from name and distance."""
+def infer_run_type(activity, week):
+    """Infer run type from Strava name, distance, and training phase."""
     name = activity.get("name", "").lower()
     dist = activity.get("distance", 0) / 1000
 
-    if any(w in name for w in ["brc", "interval", "track", "speed"]):
+    # BRC / interval keywords
+    if any(w in name for w in ["brc", "interval", "track", "speed", "tempo"]):
         return "Intervals"
-    if dist >= 13 or "long" in name:
+    # Long run by distance (13km+ in base, lower threshold later)
+    if dist >= 13:
         return "Long Run"
+    # Short recovery run
+    if dist <= 8:
+        return "Zone Two"
+    # Default 9-12km = Zone Two
     return "Zone Two"
 
 
 def create_notion_entry(activity):
-    """Create a new page in the Notion Runs database."""
-    dist_km = round(activity["distance"] / 1000, 2)
-    avg_pace = format_pace(activity.get("average_speed", 0))
-    avg_hr = activity.get("average_heartrate")
-    run_type = infer_run_type(activity)
+    dist_km   = round(activity["distance"] / 1000, 2)
+    avg_pace  = format_pace(activity.get("average_speed", 0))
+    avg_hr    = activity.get("average_heartrate")
     strava_id = str(activity["id"])
-    date_str = activity["start_date_local"][:10]
-    name = activity.get("name", "Run")
+    date_str  = activity["start_date_local"][:10]
+    run_date  = date.fromisoformat(date_str)
+    name      = activity.get("name", "Run")
+
+    week  = get_training_week(run_date)
+    phase = get_phase(week)
+    run_type = infer_run_type(activity, week)
+    week_label = f"Week {week}" if week > 0 else "Pre-plan"
 
     properties = {
-        "Week": {"title": [{"text": {"content": name}}]},
-        "Run Date": {"date": {"start": date_str}},
-        "Run Type": {"select": {"name": run_type}},
+        "Week":         {"title": [{"text": {"content": name}}]},
+        "Run Date":     {"date": {"start": date_str}},
+        "Run Type":     {"select": {"name": run_type}},
         "Distance, km": {"number": dist_km},
-        "Avg Pace": {"rich_text": [{"text": {"content": avg_pace}}]},
-        "Notes": {"rich_text": [{"text": {"content": f"strava_id:{strava_id}"}}]},
+        "Avg Pace":     {"rich_text": [{"text": {"content": avg_pace}}]},
+        "Notes":        {"rich_text": [{"text": {"content": f"strava_id:{strava_id}"}}]},
+        "Phase":        {"select": {"name": phase}},
     }
 
     if avg_hr:
@@ -165,36 +193,31 @@ def create_notion_entry(activity):
                                  headers=notion_headers(), method="POST")
     try:
         with urllib.request.urlopen(req) as resp:
-            result = json.loads(resp.read())
-            return result.get("id")
+            return json.loads(resp.read()).get("id"), week_label, phase
     except urllib.error.HTTPError as e:
         print(f"ERROR: Notion page creation failed: {e.read().decode()}")
-        return None
+        return None, week_label, phase
 
 
-# ── Main sync ────────────────────────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     check_env()
     print(f"[{datetime.now(timezone.utc).isoformat()}] Starting Strava → Notion sync...")
 
-    # Get fresh Strava token
     access_token = get_strava_token()
     print("✓ Strava token refreshed")
 
-    # Fetch recent runs
     runs = fetch_recent_runs(access_token)
-    print(f"✓ Found {len(runs)} runs in last {SYNC_LOOKBACK_DAYS} days")
+    print(f"✓ Found {len(runs)} run(s) in last {SYNC_LOOKBACK_DAYS} days")
 
     if not runs:
         print("Nothing to sync. Done.")
         return
 
-    # Get already-synced Strava IDs from Notion
     existing_ids = get_existing_strava_ids()
-    print(f"✓ {len(existing_ids)} runs already in Notion")
+    print(f"✓ {len(existing_ids)} run(s) already in Notion")
 
-    # Sync new runs
     new_count = 0
     for run in runs:
         strava_id = str(run["id"])
@@ -202,11 +225,11 @@ def main():
             print(f"  → Skipping '{run['name']}' (already synced)")
             continue
 
-        page_id = create_notion_entry(run)
+        page_id, week_label, phase = create_notion_entry(run)
         if page_id:
             dist = round(run["distance"] / 1000, 2)
             pace = format_pace(run.get("average_speed", 0))
-            print(f"  ✓ Synced '{run['name']}' — {dist}km @ {pace}/km")
+            print(f"  ✓ Synced '{run['name']}' — {dist}km @ {pace}/km [{week_label}, {phase}]")
             new_count += 1
         else:
             print(f"  ✗ Failed to sync '{run['name']}'")
