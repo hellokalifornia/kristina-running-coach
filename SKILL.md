@@ -141,41 +141,45 @@ she may start attending BRC twice per week (Tue + Thu) as her interval sessions.
 
 ## Data Sources
 
-### Strava (primary — fetch first)
-Kristina's Strava is the ground truth for all run data. Every run is logged here automatically
-via Apple Watch. When asked about recent runs or training, **always fetch from Strava first**.
-
-Use the script at `strava/fetch_runs.py`. See `strava/README.md` for setup.
-
-```bash
-python strava/fetch_runs.py --days 14    # last 2 weeks
-python strava/fetch_runs.py --count 10   # last 10 runs
-python strava/fetch_runs.py --days 7 --json  # raw JSON for analysis
-```
-
-When the Strava API is fully connected, all fetched data should be stored in the
-**Strava Archive Notion database** (to be created) so there's a persistent, searchable
-record beyond the 14-day fetch window.
-
-Key interpretation notes:
-- Strava activity names carry real signal — always read them
-- Unusually slow Zone 2 paces may reflect GPS error, not fitness regression
-- Always express paces as MM:SS/km (e.g. 6:15/km, never 6.25/km)
-
-### Notion Training Log (manual cross-reference)
-Kristina manually logs runs in Notion with subjective fields that Strava doesn't capture.
-This is NOT auto-synced — it's her own curated layer on top of Strava data.
+### Notion Training Log (primary — read this first)
+The 🎽 Runs database is the single source of truth for training analysis. It is
+**pre-populated with planned rows** for every run in the 27-week plan. The Strava → Notion
+sync fills in actual data when runs are completed.
 
 Database URL: `https://www.notion.so/klfrn/33dd769ea65280d8aab5f7e361138e68`
 Data source: `collection://33dd769e-a652-80d1-8169-000bfb1f0443`
 
-Fields logged manually:
-- **Week** (title), **Phase**, **Run Date**, **Run Type** (Zone Two / Intervals / Long Run)
-- **Distance, km**, **Plan, km**, **Avg Pace** (text, MM:SS format), **Average HR**
-- **Feeling** (😵 Dead / 😓 Rough / 😐 Fine / 😊 Good / 🔥 Flew), **Notes**, **Place**
+Schema:
+- **Week** (title) — e.g. "Week 5", filled with Strava activity name once completed
+- **Phase** — Phase 1-Base / Phase 2-Tempo / Phase 3-Race Specific / Phase 4-Taper
+- **Run Type** — Zone Two / Intervals / Long Run
+- **Plan, km** — planned distance
+- **Run Date** — empty until completed
+- **Distance, km**, **Avg Pace** (MM:SS), **Average HR** — filled by sync
+- **Strava ID** — text field, filled by sync for deduplication
+- **Feeling** (😵 Dead / 😓 Rough / 😐 Fine / 😊 Good / 🔥 Flew) — filled manually by Kristina
+- **Notes** — filled manually by Kristina
+- **Place** — location field
 
-Use Notion as a cross-reference for subjective data (Feeling, Notes) and plan compliance
-(Plan, km vs Distance, km). Strava is the objective record; Notion is the human layer.
+**Empty rows** (no Run Date, no Strava ID) = planned but not yet completed.
+**Filled rows** (has Run Date + Strava ID) = completed and synced from Strava.
+
+### Strava → Notion Automation
+A GitHub Actions cron job runs every hour (free) via `sync/strava_to_notion.py`.
+
+Logic: fetches runs from last 3 days → checks Strava ID column for duplicates →
+identifies run type (BRC in name → Intervals, >10km → Long Run, else → Zone Two) →
+calculates training week from run date → finds matching empty row in that week →
+**updates** that row with actual data. Never creates new rows. Skips unplanned runs.
+
+Credentials stored in: Notion page 🔐 Strava API Credentials (private)
+GitHub repo: `hellokalifornia/kristina-running-coach`
+
+### Strava interpretation notes
+- Activity names carry real signal — always read them (e.g. "Zone 2 Torture", "BRC Tuesday")
+- Unusually slow Zone 2 paces may reflect GPS error, not fitness regression
+- Always express paces as MM:SS/km (e.g. 6:15/km, never 6.25/km)
+- Apple Watch optical HR — generally reliable, may lag slightly on surges
 
 ---
 
