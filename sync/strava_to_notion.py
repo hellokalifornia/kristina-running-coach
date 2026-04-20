@@ -53,9 +53,9 @@ def infer_run_type(activity: dict) -> str:
     dist = activity.get("distance", 0) / 1000
     if "brc" in name:
         return "Intervals"
-    if dist > 10:
+    if dist >= 13:
         return "Long Run"
-    if dist <= 7:
+    if dist <= 8:
         return "Zone Two"  # recovery
     return "Zone Two"
 
@@ -156,12 +156,17 @@ def get_row_props(row: dict) -> dict:
         d = props.get(key, {}).get("date")
         return d.get("start", "") if d else ""
 
+    # Read Strava ID column, stripping any accidental "strava_id:" prefix
+    strava_id = text("Strava ID").strip()
+    if strava_id.startswith("strava_id:"):
+        strava_id = strava_id.replace("strava_id:", "").strip()
+
     return {
         "id": row["id"],
         "week": title("Week"),
         "run_type": select("Run Type"),
         "run_date": run_date("Run Date"),
-        "strava_id": text("Strava ID"),
+        "strava_id": strava_id,
         "phase": select("Phase"),
     }
 
@@ -251,9 +256,12 @@ def main():
             continue
 
         # Find matching empty row: same week + same run type + no run date yet
+        # Match week_label as prefix since title may have been overwritten with activity name
         target = None
         for row in parsed_rows:
-            if (row["week"] == week_label
+            week_matches = (row["week"] == week_label or
+                           row["week"].startswith(week_label))
+            if (week_matches
                     and row["run_type"] == run_type
                     and not row["run_date"]
                     and not row["strava_id"]):
